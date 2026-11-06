@@ -304,6 +304,30 @@ def deployEnv(Map targetCfg, String label) {
     """
 }
 
+def verifySlotLivenessAndReadiness(Map targetCfg, String label) {
+    String ns = targetCfg.namespace
+    String target = env."${label}_TARGET_SLOT"
+    echo "[${label}] Validating Liveness, Readiness & Smoke on inactive slot '${target}' in ${ns} BEFORE allowing Switch Live approval..."
+    sh """
+        set -e
+        POD=\$(kubectl get pod -n ${ns} -l app=${env.APP_NAME},slot=${target} -o jsonpath='{.items[0].metadata.name}')
+        [ -n "\$POD" ] || { echo "PRE-SWITCH CHECK FAILED: no pod found for slot '${target}' in ${ns}"; exit 1; }
+        echo "[${label}] Checking pod \$POD (slot='${target}')..."
+
+        LIVENESS=\$(kubectl get --raw "/api/v1/namespaces/${ns}/pods/\${POD}:8080/proxy/actuator/health/liveness")
+        echo "[${label}] /actuator/health/liveness -> \$LIVENESS"
+        echo "\$LIVENESS" | grep -q '"status":"UP"' || { echo "PRE-SWITCH LIVENESS FAILED on \$POD"; exit 1; }
+
+        READINESS=\$(kubectl get --raw "/api/v1/namespaces/${ns}/pods/\${POD}:8080/proxy/actuator/health/readiness")
+        echo "[${label}] /actuator/health/readiness -> \$READINESS"
+        echo "\$READINESS" | grep -q '"status":"UP"' || { echo "PRE-SWITCH READINESS FAILED on \$POD"; exit 1; }
+
+        SMOKE=\$(kubectl get --raw "/api/v1/namespaces/${ns}/pods/\${POD}:8080/proxy${env.SMOKE_PATH}")
+        echo "\$SMOKE" | grep -q '${env.SMOKE_EXPECT}' || { echo "PRE-SWITCH SMOKE FAILED on \$POD (${env.SMOKE_PATH})"; exit 1; }
+        echo "[${label}] PRE-SWITCH VALIDATION PASSED on slot '${target}' (pod=\$POD): Liveness=UP, Readiness=UP, Smoke=${env.SMOKE_PATH} OK"
+    """
+}
+
 def switchLiveAndSmoke(Map targetCfg, String label) {
     ensureManifestsOnDisk()
     String ns = targetCfg.namespace
