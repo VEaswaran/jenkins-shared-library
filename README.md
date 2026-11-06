@@ -7,6 +7,15 @@ Reusable Jenkins Global Shared Library for Spring Boot + Gradle microservices de
 - `vars/snykScanPipeline.groovy` — Independent Snyk CLI vulnerability scan pipeline
 - `resources/k8s/deployment.yaml` & `resources/k8s/service.yaml` — Default parameterized Kubernetes manifests used automatically if a project repo does not provide its own `k8s/` folder
 
+## Quality Gate Mapping (`QG`)
+Each project repo controls which quality gates run via the `QG` option (or the `QG` parameter in Jenkins):
+- **`QG1`** — Unit Tests (`./gradlew clean test`)
+- **`QG2`** — Integration Tests (`./gradlew integrationTest`)
+- **`QG3`** — Coverage Gate (`./gradlew jacocoTestReport jacocoTestCoverageVerification`)
+- **`QG4`** — Security Scan (`order-api-snyk-scan` job after `dev1` switch-live)
+
+If a gate is included in `QG`, Jenkins executes it; if omitted, Jenkins skips that stage.
+
 ## Usage in Any Project Repo
 
 ### `Jenkinsfile`
@@ -15,6 +24,7 @@ Reusable Jenkins Global Shared Library for Spring Boot + Gradle microservices de
 
 springGkePipeline(
     appName:     'order-api',
+    QG:          ['QG1', 'QG2', 'QG3', 'QG4'], // Remove any gate to skip it
     dev1Ns:      'order-api-dev1',
     dev2Ns:      'order-api-dev2',
     healthPath:  '/actuator/health',

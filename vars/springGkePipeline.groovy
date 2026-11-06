@@ -12,10 +12,23 @@ def call(Map cfg = [:]) {
     String smokePath    = cfg.smokePath    ?: '/api/orders/1001'
     String smokeExpect  = cfg.smokeExpect  ?: '"orderId":1001'
 
+    // Quality Gate mapping:
+    //   QG1 = Unit Tests
+    //   QG2 = Integration Tests
+    //   QG3 = Coverage Gate (JaCoCo)
+    //   QG4 = Security Scan (Snyk)
+    def rawQg = cfg.QG != null ? cfg.QG : (cfg.qualityGates != null ? cfg.qualityGates : ['QG1', 'QG2', 'QG3', 'QG4'])
+    List<String> repoQgList = (rawQg instanceof Collection)
+            ? rawQg.collect { it.toString().trim().toUpperCase() }
+            : rawQg.toString().split(',').collect { it.trim().toUpperCase() }.findAll { it }
+    String defaultQgCsv = repoQgList.join(',')
+
     pipeline {
         agent any
 
         parameters {
+            string(name: 'QG', defaultValue: defaultQgCsv,
+                   description: 'Enabled Quality Gates (comma-separated): QG1=Unit Tests, QG2=Integration Tests, QG3=Coverage Gate, QG4=Snyk Security Scan')
             string(name: 'GCP_PROJECT_ID', defaultValue: gcpProjectId, description: 'GCP Project ID')
             string(name: 'GCP_REGION', defaultValue: gcpRegion, description: 'GCP Region')
             string(name: 'GKE_CLUSTER', defaultValue: gkeCluster, description: 'GKE Cluster Name')
@@ -25,6 +38,7 @@ def call(Map cfg = [:]) {
 
         environment {
             APP_NAME = "${appName}"
+            ENABLED_QG = "${params.QG != null ? params.QG : defaultQgCsv}"
             IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : 'latest'}"
             IMAGE_URI = "${params.GCP_REGION}-docker.pkg.dev/${params.GCP_PROJECT_ID}/${params.AR_REPO}/${params.IMAGE_NAME}:${IMAGE_TAG}"
             USE_GKE_GCLOUD_AUTH_PLUGIN = 'True'
@@ -40,10 +54,14 @@ def call(Map cfg = [:]) {
             stage('Checkout') {
                 steps {
                     checkout scm
+                    script {
+                        echo "Quality Gates configured for ${env.APP_NAME}: ${env.ENABLED_QG} (QG1=Unit, QG2=Integration, QG3=Coverage, QG4=Snyk)"
+                    }
                 }
             }
 
-            stage('Unit Tests') {
+            stage('QG1 - Unit Tests') {
+                when { expression { return isGateEnabled('QG1') } }
                 steps {
                     script {
                         if (isUnix()) {
@@ -60,11 +78,12 @@ def call(Map cfg = [:]) {
                 }
             }
 
-            stage('Integration Tests') {
+            stage('QG2 - Integration Tests') {
+                when { expression { return isGateEnabled('QG2') } }
                 steps {
                     script {
                         if (isUnix()) {
-                            sh './gradlew integrationTest --no-daemon'
+                            sh 'chmod +x gradlew && ./gradlew integrationTest --no-daemon'
                         } else {
                             bat 'gradlew.bat integrationTest --no-daemon'
                         }
@@ -77,11 +96,12 @@ def call(Map cfg = [:]) {
                 }
             }
 
-            stage('Coverage Gate') {
+            stage('QG3 - Coverage Gate') {
+                when { expression { return isGateEnabled('QG3') } }
                 steps {
                     script {
                         if (isUnix()) {
-                            sh './gradlew jacocoTestReport jacocoTestCoverageVerification --no-daemon'
+                            sh 'chmod +x gradlew && ./gradlew jacocoTestReport jacocoTestCoverageVerification --no-daemon'
                         } else {
                             bat 'gradlew.bat jacocoTestReport jacocoTestCoverageVerification --no-daemon'
                         }
@@ -145,8 +165,8 @@ def call(Map cfg = [:]) {
                 }
             }
 
-            stage('Security Scan - dev1') {
-                when { expression { return isUnix() } }
+            stage('QG4 - Security Scan - dev1') {
+                when { expression { return isUnix() && isGateEnabled('QG4') } }
                 steps {
                     script {
                         echo "Triggering independent scan job '${env.SNYK_SCAN_JOB}' for ${env.IMAGE_URI} (non-blocking - findings reported, build continues)"
@@ -220,6 +240,12 @@ def call(Map cfg = [:]) {
             }
         }
     }
+}
+
+def isGateEnabled(String gate) {
+    String raw = env.ENABLED_QG ?: ''
+    List<String> gates = raw.split(',').collect { it.trim().toUpperCase() }.findAll { it }
+    return gates.contains(gate.toUpperCase()) || gates.contains('ALL')
 }
 
 def activeSlot(String ns) {
