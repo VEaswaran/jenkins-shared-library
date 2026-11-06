@@ -1,16 +1,20 @@
+import groovy.json.JsonSlurperClassic
+
 def call(Map cfg = [:]) {
-    String appName      = cfg.appName      ?: 'order-api'
-    String gcpProjectId = cfg.gcpProjectId ?: 'project-d7b18774-cce1-4b87-a4a'
-    String gcpRegion    = cfg.gcpRegion    ?: 'us-central1'
-    String gkeCluster   = cfg.gkeCluster   ?: 'order-api-cluster'
-    String arRepo       = cfg.arRepo       ?: appName
-    String imageName    = cfg.imageName    ?: appName
-    String dev1Ns       = cfg.dev1Ns       ?: "${appName}-dev1"
-    String dev2Ns       = cfg.dev2Ns       ?: "${appName}-dev2"
-    String snykScanJob  = cfg.snykScanJob  ?: "${appName}-snyk-scan"
-    String healthPath   = cfg.healthPath   ?: '/actuator/health'
-    String smokePath    = cfg.smokePath    ?: '/api/orders/1001'
-    String smokeExpect  = cfg.smokeExpect  ?: '"orderId":1001'
+    String appName     = cfg.appName     ?: 'order-api'
+    String arRepo      = cfg.arRepo      ?: appName
+    String imageName   = cfg.imageName   ?: appName
+    String snykScanJob = cfg.snykScanJob ?: "${appName}-snyk-scan"
+    String healthPath  = cfg.healthPath  ?: '/actuator/health'
+    String smokePath   = cfg.smokePath   ?: '/api/orders/1001'
+    String smokeExpect = cfg.smokeExpect ?: '"orderId":1001'
+
+    // Promotion chain (Build Once -> Promote across environments, each with its own GCP Project & GKE Cluster in resources/environments.json)
+    def rawEnvs = cfg.promoteTo != null ? cfg.promoteTo : (cfg.environments != null ? cfg.environments : ['dev1', 'dev2'])
+    List<String> repoEnvList = (rawEnvs instanceof Collection)
+            ? rawEnvs.collect { it.toString().trim().toLowerCase() }
+            : rawEnvs.toString().split(',').collect { it.trim().toLowerCase() }.findAll { it }
+    String defaultEnvsCsv = repoEnvList.join(',')
 
     // Quality Gate mapping:
     //   QG1 = Unit Tests
@@ -29,21 +33,18 @@ def call(Map cfg = [:]) {
         parameters {
             string(name: 'QG', defaultValue: defaultQgCsv,
                    description: 'Enabled Quality Gates (comma-separated): QG1=Unit Tests, QG2=Integration Tests, QG3=Coverage Gate, QG4=Snyk Security Scan')
-            string(name: 'GCP_PROJECT_ID', defaultValue: gcpProjectId, description: 'GCP Project ID')
-            string(name: 'GCP_REGION', defaultValue: gcpRegion, description: 'GCP Region')
-            string(name: 'GKE_CLUSTER', defaultValue: gkeCluster, description: 'GKE Cluster Name')
-            string(name: 'AR_REPO', defaultValue: arRepo, description: 'Artifact Registry Repository')
+            string(name: 'PROMOTE_ENVS', defaultValue: defaultEnvsCsv,
+                   description: 'Ordered promotion environments (from resources/environments.json): e.g. dev1,dev2 or dev1,test,perf,stage,prod')
+            string(name: 'AR_REPO', defaultValue: arRepo, description: 'Central Artifact Registry Repository')
             string(name: 'IMAGE_NAME', defaultValue: imageName, description: 'Container Image Name')
         }
 
         environment {
             APP_NAME = "${appName}"
             ENABLED_QG = "${params.QG != null ? params.QG : defaultQgCsv}"
+            PROMOTE_CHAIN = "${params.PROMOTE_ENVS != null ? params.PROMOTE_ENVS : defaultEnvsCsv}"
             IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : 'latest'}"
-            IMAGE_URI = "${params.GCP_REGION}-docker.pkg.dev/${params.GCP_PROJECT_ID}/${params.AR_REPO}/${params.IMAGE_NAME}:${IMAGE_TAG}"
             USE_GKE_GCLOUD_AUTH_PLUGIN = 'True'
-            DEV1_NS = "${dev1Ns}"
-            DEV2_NS = "${dev2Ns}"
             SNYK_SCAN_JOB = "${snykScanJob}"
             HEALTH_PATH = "${healthPath}"
             SMOKE_PATH = "${smokePath}"
@@ -55,7 +56,15 @@ def call(Map cfg = [:]) {
                 steps {
                     checkout scm
                     script {
-                        echo "Quality Gates configured for ${env.APP_NAME}: ${env.ENABLED_QG} (QG1=Unit, QG2=Integration, QG3=Coverage, QG4=Snyk)"
+                        Map catalog = loadCatalog()
+                        Map regCfg  = (catalog.artifactRegistry ?: [:]) as Map
+                        String regProject = cfg.registryProjectId ?: (regCfg.gcpProjectId ?: 'project-d7b18774-cce1-4b87-a4a')
+                        String regRegion  = cfg.registryRegion    ?: (regCfg.gcpRegion    ?: 'us-central1')
+                        env.REGISTRY_PROJECT_ID = regProject
+                        env.REGISTRY_REGION     = regRegion
+                        env.IMAGE_URI           = "${regRegion}-docker.pkg.dev/${regProject}/${params.AR_REPO}/${params.IMAGE_NAME}:${env.IMAGE_TAG}"
+                        echo "App: ${env.APP_NAME} | QG: ${env.ENABLED_QG} | Promotion Chain: ${env.PROMOTE_CHAIN}"
+                        echo "Single immutable image for all environments: ${env.IMAGE_URI}"
                     }
                 }
             }
@@ -114,22 +123,25 @@ def call(Map cfg = [:]) {
                 }
             }
 
-            stage('Build & Push Image') {
+            stage('Build & Push Image (Once)') {
                 steps {
                     script {
+                        Map catalog = loadCatalog()
+                        Map envsMap = (catalog.environments ?: [:]) as Map
                         if (isUnix()) {
                             sh """
-                                gcloud config set project ${params.GCP_PROJECT_ID}
+                                gcloud config set project ${env.REGISTRY_PROJECT_ID}
                                 gcloud builds submit --tag ${env.IMAGE_URI} .
                             """
                         } else {
+                            Map firstEnv = resolveEnvConfig(envsMap, 'dev1', appName, cfg)
                             powershell """
                                 \\$ErrorActionPreference = 'Stop'
                                 .\\deploy-gke.ps1 `
-                                    -ProjectId '${params.GCP_PROJECT_ID}' `
-                                    -Region '${params.GCP_REGION}' `
-                                    -ClusterName '${params.GKE_CLUSTER}' `
-                                    -Namespace '${env.DEV1_NS}' `
+                                    -ProjectId '${firstEnv.gcpProjectId}' `
+                                    -Region '${firstEnv.gcpRegion}' `
+                                    -ClusterName '${firstEnv.gkeCluster}' `
+                                    -Namespace '${firstEnv.namespace}' `
                                     -Repository '${params.AR_REPO}' `
                                     -ImageName '${params.IMAGE_NAME}' `
                                     -Tag '${env.IMAGE_TAG}'
@@ -139,89 +151,72 @@ def call(Map cfg = [:]) {
                 }
             }
 
-            stage('Deploy to dev1') {
-                when { expression { return isUnix() } }
-                steps {
-                    script { deployEnv(env.DEV1_NS, 'DEV1') }
-                }
-            }
-
-            stage('Approve Switch Live - dev1') {
+            stage('Promote Across Environments') {
                 when { expression { return isUnix() } }
                 steps {
                     script {
-                        String msg = "[dev1 / ${env.DEV1_NS}] NEW build ${env.IMAGE_URI} is Ready on slot '${env.DEV1_TARGET_SLOT}' (live: slot '${env.DEV1_LIVE_SLOT}' = ${env.DEV1_LIVE_IMG} @ http://${env.DEV1_LB_IP}). Approve = traffic -> '${env.DEV1_TARGET_SLOT}', then '${env.DEV1_LIVE_SLOT}' removed."
-                        timeout(time: 15, unit: 'MINUTES') {
-                            input message: msg, ok: 'Switch Live'
-                        }
-                    }
-                }
-            }
+                        Map catalog = loadCatalog()
+                        Map envsMap = (catalog.environments ?: [:]) as Map
+                        List<String> chain = (env.PROMOTE_CHAIN ?: '')
+                                .split(',')
+                                .collect { it.trim().toLowerCase() }
+                                .findAll { it }
+                        String prevEnvInfo = ''
 
-            stage('Switch Live - dev1') {
-                when { expression { return isUnix() } }
-                steps {
-                    script { switchLiveAndSmoke(env.DEV1_NS, 'DEV1') }
-                }
-            }
+                        for (int idx = 0; idx < chain.size(); idx++) {
+                            String envKey = chain[idx]
+                            String label  = envKey.toUpperCase()
+                            Map targetCfg = resolveEnvConfig(envsMap, envKey, appName, cfg)
 
-            stage('QG4 - Security Scan - dev1') {
-                when { expression { return isUnix() && isGateEnabled('QG4') } }
-                steps {
-                    script {
-                        echo "Triggering independent scan job '${env.SNYK_SCAN_JOB}' for ${env.IMAGE_URI} (non-blocking - findings reported, build continues)"
-                        try {
-                            def scan = build job: env.SNYK_SCAN_JOB, wait: true, propagate: false,
-                                      parameters: [string(name: 'IMAGE_URI', value: env.IMAGE_URI)]
-                            if (scan.result != 'SUCCESS') {
-                                echo "SECURITY SCAN result: ${scan.result} - proceeding anyway (advisory only)"
-                                currentBuild.result = 'UNSTABLE'
-                            } else {
-                                echo "SECURITY SCAN passed"
+                            if (idx > 0) {
+                                stage("Approve Promote -> ${envKey}") {
+                                    String promoteMsg = "${prevEnvInfo}. Promote immutable image ${env.IMAGE_URI} to '${envKey}' (project: ${targetCfg.gcpProjectId}, cluster: ${targetCfg.gkeCluster}, ns: ${targetCfg.namespace})? Deploys to INACTIVE slot first."
+                                    timeout(time: 15, unit: 'MINUTES') {
+                                        input message: promoteMsg, ok: "Deploy to ${envKey}"
+                                    }
+                                }
                             }
-                        } catch (Exception e) {
-                            echo "Security scan could not run: ${e.message} - proceeding anyway"
-                            currentBuild.result = 'UNSTABLE'
+
+                            stage("Deploy to ${envKey}") {
+                                deployEnv(targetCfg, label)
+                            }
+
+                            stage("Approve Switch Live - ${envKey}") {
+                                String liveSlot   = env."${label}_LIVE_SLOT"
+                                String targetSlot = env."${label}_TARGET_SLOT"
+                                String liveImg    = env."${label}_LIVE_IMG"
+                                String lbIp       = env."${label}_LB_IP"
+                                String switchMsg  = "[${envKey} | project=${targetCfg.gcpProjectId} | ns=${targetCfg.namespace}] NEW build ${env.IMAGE_URI} is Ready on slot '${targetSlot}' (live: slot '${liveSlot}' = ${liveImg} @ http://${lbIp}). Approve = traffic -> '${targetSlot}', then '${liveSlot}' removed."
+                                timeout(time: 15, unit: 'MINUTES') {
+                                    input message: switchMsg, ok: "Switch Live (${envKey})"
+                                }
+                            }
+
+                            stage("Switch Live - ${envKey}") {
+                                switchLiveAndSmoke(targetCfg, label)
+                                prevEnvInfo = "${envKey} is live on slot '${env."${label}_TARGET_SLOT"}' @ http://${env."${label}_LB_IP"}"
+                            }
+
+                            if (idx == 0 && isGateEnabled('QG4')) {
+                                stage("QG4 - Security Scan - ${envKey}") {
+                                    echo "Triggering independent scan job '${env.SNYK_SCAN_JOB}' for ${env.IMAGE_URI} (non-blocking - findings reported, build continues)"
+                                    try {
+                                        def scan = build job: env.SNYK_SCAN_JOB, wait: true, propagate: false,
+                                                  parameters: [string(name: 'IMAGE_URI', value: env.IMAGE_URI)]
+                                        if (scan.result != 'SUCCESS') {
+                                            echo "SECURITY SCAN result: ${scan.result} - proceeding anyway (advisory only)"
+                                            currentBuild.result = 'UNSTABLE'
+                                        } else {
+                                            echo "SECURITY SCAN passed"
+                                        }
+                                    } catch (Exception e) {
+                                        echo "Security scan could not run: ${e.message} - proceeding anyway"
+                                        currentBuild.result = 'UNSTABLE'
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-            }
-
-            stage('Approve Deploy - dev2') {
-                when { expression { return isUnix() } }
-                steps {
-                    script {
-                        String msg = "dev1 is live on slot '${env.DEV1_TARGET_SLOT}' @ http://${env.DEV1_LB_IP}. Deploy ${env.IMAGE_URI} to dev2 / ${env.DEV2_NS}? It goes to dev2's INACTIVE slot first - not live until you approve."
-                        timeout(time: 15, unit: 'MINUTES') {
-                            input message: msg, ok: 'Deploy to dev2'
-                        }
-                    }
-                }
-            }
-
-            stage('Deploy to dev2') {
-                when { expression { return isUnix() } }
-                steps {
-                    script { deployEnv(env.DEV2_NS, 'DEV2') }
-                }
-            }
-
-            stage('Approve Switch Live - dev2') {
-                when { expression { return isUnix() } }
-                steps {
-                    script {
-                        String msg = "[dev2 / ${env.DEV2_NS}] NEW build ${env.IMAGE_URI} is Ready on slot '${env.DEV2_TARGET_SLOT}' (live: slot '${env.DEV2_LIVE_SLOT}' = ${env.DEV2_LIVE_IMG} @ http://${env.DEV2_LB_IP}). Approve = traffic -> '${env.DEV2_TARGET_SLOT}', then '${env.DEV2_LIVE_SLOT}' removed."
-                        timeout(time: 15, unit: 'MINUTES') {
-                            input message: msg, ok: 'Switch Live'
-                        }
-                    }
-                }
-            }
-
-            stage('Switch Live - dev2') {
-                when { expression { return isUnix() } }
-                steps {
-                    script { switchLiveAndSmoke(env.DEV2_NS, 'DEV2') }
                 }
             }
         }
@@ -240,6 +235,23 @@ def call(Map cfg = [:]) {
             }
         }
     }
+}
+
+def loadCatalog() {
+    return new JsonSlurperClassic().parseText(libraryResource('environments.json')) as Map
+}
+
+def resolveEnvConfig(Map envsMap, String envKey, String appName, Map cfg) {
+    Map raw = (envsMap[envKey] ?: [:]) as Map
+    String suffix = raw.namespaceSuffix ?: envKey
+    String customNs = cfg."${envKey}Ns" ?: "${appName}-${suffix}"
+    return [
+        envKey      : envKey,
+        gcpProjectId: (raw.gcpProjectId ?: 'project-d7b18774-cce1-4b87-a4a') as String,
+        gcpRegion   : (raw.gcpRegion    ?: 'us-central1') as String,
+        gkeCluster  : (raw.gkeCluster   ?: 'order-api-cluster') as String,
+        namespace   : customNs as String
+    ]
 }
 
 def isGateEnabled(String gate) {
@@ -265,9 +277,10 @@ def ensureManifestsOnDisk() {
     }
 }
 
-def deployEnv(String ns, String label) {
+def deployEnv(Map targetCfg, String label) {
     ensureManifestsOnDisk()
-    sh "gcloud container clusters get-credentials ${params.GKE_CLUSTER} --region=${params.GCP_REGION} --project=${params.GCP_PROJECT_ID} -q"
+    String ns = targetCfg.namespace
+    sh "gcloud container clusters get-credentials ${targetCfg.gkeCluster} --region=${targetCfg.gcpRegion} --project=${targetCfg.gcpProjectId} -q"
     sh "kubectl get namespace ${ns} >/dev/null 2>&1 || kubectl create namespace ${ns}"
     String live = activeSlot(ns)
     String target = live ? (live == 'blue' ? 'green' : 'blue') : 'blue'
@@ -279,7 +292,7 @@ def deployEnv(String ns, String label) {
     env."${label}_TARGET_SLOT" = target
     env."${label}_LIVE_IMG" = liveImg ?: 'none'
     env."${label}_LB_IP" = lbIp ?: 'pending'
-    echo "[${label}] ${ns}: LIVE slot='${live ?: 'none'}' (${liveImg ?: 'none'}) | NEW build ${env.IMAGE_URI} -> slot '${target}' | app URL http://${lbIp ?: 'pending'} (traffic NOT switched yet)"
+    echo "[${label}] project=${targetCfg.gcpProjectId} cluster=${targetCfg.gkeCluster} ns=${ns}: LIVE slot='${live ?: 'none'}' (${liveImg ?: 'none'}) | NEW build ${env.IMAGE_URI} -> slot '${target}' | app URL http://${lbIp ?: 'pending'} (traffic NOT switched yet)"
     sh """
         sed -e "s|APP_PLACEHOLDER|${env.APP_NAME}|g" -e "s|IMAGE_PLACEHOLDER|${env.IMAGE_URI}|g" -e "s|SLOT_PLACEHOLDER|${target}|g" k8s/deployment.yaml | kubectl apply -n ${ns} -f -
         kubectl rollout status deployment/${env.APP_NAME}-${target} -n ${ns} --timeout=10m
@@ -287,11 +300,12 @@ def deployEnv(String ns, String label) {
     """
 }
 
-def switchLiveAndSmoke(String ns, String label) {
+def switchLiveAndSmoke(Map targetCfg, String label) {
     ensureManifestsOnDisk()
+    String ns = targetCfg.namespace
     String target = env."${label}_TARGET_SLOT"
     String oldSlot = env."${label}_LIVE_SLOT"
-    echo "[${label}] Switching service selector -> slot '${target}'"
+    echo "[${label}] Switching service selector in ${ns} (project=${targetCfg.gcpProjectId}) -> slot '${target}'"
     sh "sed -e 's|APP_PLACEHOLDER|${env.APP_NAME}|g' -e 's|SLOT_PLACEHOLDER|${target}|g' k8s/service.yaml | kubectl apply -n ${ns} -f -"
     String ip = ''
     for (int i = 0; i < 30 && !ip; i++) {
@@ -300,8 +314,9 @@ def switchLiveAndSmoke(String ns, String label) {
         if (!ip) { sleep time: 10, unit: 'SECONDS' }
     }
     if (!ip) { error "LoadBalancer IP not assigned for ${ns}" }
+    env."${label}_LB_IP" = ip
     sh "kubectl get endpoints ${env.APP_NAME} -n ${ns}"
-    echo "SWITCHED LIVE: ${ns} -> slot '${target}' (${env.IMAGE_URI}) @ http://${ip}"
+    echo "SWITCHED LIVE: ${ns} (project=${targetCfg.gcpProjectId}) -> slot '${target}' (${env.IMAGE_URI}) @ http://${ip}"
     sh """
         set -e
         healthy=""

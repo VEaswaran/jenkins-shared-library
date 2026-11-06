@@ -1,0 +1,50 @@
+{
+  "artifactRegistry": {
+    "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+    "gcpRegion": "us-central1"
+  },
+  "environments": {
+    "dev1": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "dev1",
+      "runSecurityScan": true
+    },
+    "dev2": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "dev2",
+      "runSecurityScan": false
+    },
+    "test": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "test",
+      "runSecurityScan": false
+    },
+    "perf": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "perf",
+      "runSecurityScan": false
+    },
+    "stage": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "stage",
+      "runSecurityScan": false
+    },
+    "prod": {
+      "gcpProjectId": "project-d7b18774-cce1-4b87-a4a",
+      "gcpRegion": "us-central1",
+      "gkeCluster": "order-api-cluster",
+      "namespaceSuffix": "prod",
+      "runSecurityScan": false
+    }
+  }
+}

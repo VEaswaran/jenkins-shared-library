@@ -3,8 +3,9 @@
 Reusable Jenkins Global Shared Library for Spring Boot + Gradle microservices deploying to GKE with Blue/Green slots, staged approvals, and Snyk security scanning.
 
 ## Structure
-- `vars/springGkePipeline.groovy` — Full CI/CD pipeline (Unit, Integration, JaCoCo Coverage Gate, Cloud Build, GKE Blue/Green deploy + approval + switch + smoke + old-slot deletion for `dev1` & `dev2`, and non-blocking Snyk scan trigger)
+- `vars/springGkePipeline.groovy` — Build-Once, Promote-Many CI/CD pipeline (QG1-QG4 quality gates, single Artifact Registry build, sequential promotion across environments with Blue/Green deploy, manual approvals, traffic switch, smoke check, and old-slot deletion)
 - `vars/snykScanPipeline.groovy` — Independent Snyk CLI vulnerability scan pipeline
+- `resources/environments.json` — Central enterprise environment catalog mapping `artifactRegistry` and each environment (`dev1`, `dev2`, `test`, `perf`, `stage`, `prod`) to its own `gcpProjectId`, `gcpRegion`, `gkeCluster`, and namespace suffix
 - `resources/k8s/deployment.yaml` & `resources/k8s/service.yaml` — Default parameterized Kubernetes manifests used automatically if a project repo does not provide its own `k8s/` folder
 
 ## Quality Gate Mapping (`QG`)
@@ -12,11 +13,11 @@ Each project repo controls which quality gates run via the `QG` option (or the `
 - **`QG1`** — Unit Tests (`./gradlew clean test`)
 - **`QG2`** — Integration Tests (`./gradlew integrationTest`)
 - **`QG3`** — Coverage Gate (`./gradlew jacocoTestReport jacocoTestCoverageVerification`)
-- **`QG4`** — Security Scan (`order-api-snyk-scan` job after `dev1` switch-live)
+- **`QG4`** — Security Scan (`<appName>-snyk-scan` job after first environment switch-live)
 
 If a gate is included in `QG`, Jenkins executes it; if omitted, Jenkins skips that stage.
 
-## Usage in Any Project Repo
+## Usage in Any Project Repo (Zero GCP Project IDs in App Repo)
 
 ### `Jenkinsfile`
 ```groovy
@@ -24,9 +25,8 @@ If a gate is included in `QG`, Jenkins executes it; if omitted, Jenkins skips th
 
 springGkePipeline(
     appName:     'order-api',
-    QG:          ['QG1', 'QG2', 'QG3', 'QG4'], // Remove any gate to skip it
-    dev1Ns:      'order-api-dev1',
-    dev2Ns:      'order-api-dev2',
+    QG:          ['QG1', 'QG2', 'QG3', 'QG4'],
+    promoteTo:   ['dev1', 'dev2'], // or ['dev1', 'test', 'perf', 'stage', 'prod']
     healthPath:  '/actuator/health',
     smokePath:   '/api/orders/1001',
     smokeExpect: '"orderId":1001'
