@@ -181,12 +181,16 @@ def call(Map cfg = [:]) {
                                 deployEnv(targetCfg, label)
                             }
 
+                            stage("Verify Liveness & Readiness - ${envKey}") {
+                                verifySlotLivenessAndReadiness(targetCfg, label)
+                            }
+
                             stage("Approve Switch Live - ${envKey}") {
                                 String liveSlot   = env."${label}_LIVE_SLOT"
                                 String targetSlot = env."${label}_TARGET_SLOT"
                                 String liveImg    = env."${label}_LIVE_IMG"
                                 String lbIp       = env."${label}_LB_IP"
-                                String switchMsg  = "[${envKey} | project=${targetCfg.gcpProjectId} | ns=${targetCfg.namespace}] NEW build ${env.IMAGE_URI} is Ready on slot '${targetSlot}' (live: slot '${liveSlot}' = ${liveImg} @ http://${lbIp}). Approve = traffic -> '${targetSlot}', then '${liveSlot}' removed."
+                                String switchMsg  = "[${envKey} | project=${targetCfg.gcpProjectId} | ns=${targetCfg.namespace}] Liveness=UP & Readiness=UP verified on slot '${targetSlot}' (${env.IMAGE_URI}). Current live: slot '${liveSlot}' (${liveImg} @ http://${lbIp}). Approve = traffic -> '${targetSlot}', then '${liveSlot}' removed."
                                 timeout(time: 15, unit: 'MINUTES') {
                                     input message: switchMsg, ok: "Switch Live (${envKey})"
                                 }
