@@ -8,6 +8,7 @@ def call(Map cfg = [:]) {
     String healthPath  = cfg.healthPath  ?: '/actuator/health'
     String smokePath   = cfg.smokePath   ?: '/api/orders/1001'
     String smokeExpect = cfg.smokeExpect ?: '"orderId":1001'
+    int approvalTimeoutMinutes = (cfg.approvalTimeoutMinutes != null) ? (cfg.approvalTimeoutMinutes as int) : 0
 
     // Promotion chain (Build Once -> Promote across environments, each with its own GCP Project & GKE Cluster in resources/environments.json)
     def rawEnvs = cfg.promoteTo != null ? cfg.promoteTo : (cfg.environments != null ? cfg.environments : ['dev1', 'dev2'])
@@ -28,7 +29,7 @@ def call(Map cfg = [:]) {
     String defaultQgCsv = repoQgList.join(',')
 
     pipeline {
-        agent any
+        agent none
 
         parameters {
             string(name: 'QG', defaultValue: defaultQgCsv,
@@ -43,7 +44,6 @@ def call(Map cfg = [:]) {
             APP_NAME = "${appName}"
             ENABLED_QG = "${params.QG != null ? params.QG : defaultQgCsv}"
             PROMOTE_CHAIN = "${params.PROMOTE_ENVS != null ? params.PROMOTE_ENVS : defaultEnvsCsv}"
-            IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : 'latest'}"
             USE_GKE_GCLOUD_AUTH_PLUGIN = 'True'
             SNYK_SCAN_JOB = "${snykScanJob}"
             HEALTH_PATH = "${healthPath}"
@@ -52,107 +52,117 @@ def call(Map cfg = [:]) {
         }
 
         stages {
-            stage('Checkout') {
-                steps {
-                    checkout scm
-                    script {
-                        Map catalog = loadCatalog()
-                        Map regCfg  = (catalog.artifactRegistry ?: [:]) as Map
-                        String regProject = cfg.registryProjectId ?: (regCfg.gcpProjectId ?: 'project-d7b18774-cce1-4b87-a4a')
-                        String regRegion  = cfg.registryRegion    ?: (regCfg.gcpRegion    ?: 'us-central1')
-                        env.REGISTRY_PROJECT_ID = regProject
-                        env.REGISTRY_REGION     = regRegion
-                        env.IMAGE_URI           = "${regRegion}-docker.pkg.dev/${regProject}/${params.AR_REPO}/${params.IMAGE_NAME}:${env.IMAGE_TAG}"
-                        echo "App: ${env.APP_NAME} | QG: ${env.ENABLED_QG} | Promotion Chain: ${env.PROMOTE_CHAIN}"
-                        echo "Single immutable image for all environments: ${env.IMAGE_URI}"
-                    }
-                }
-            }
-
-            stage('QG1 - Unit Tests') {
-                when { expression { return isGateEnabled('QG1') } }
-                steps {
-                    script {
-                        if (isUnix()) {
-                            sh 'chmod +x gradlew && ./gradlew clean test --no-daemon'
-                        } else {
-                            bat 'gradlew.bat clean test --no-daemon'
+            stage('CI & Build Image') {
+                agent any
+                stages {
+                    stage('Checkout') {
+                        steps {
+                            checkout scm
+                            script {
+                                Map catalog = loadCatalog()
+                                Map regCfg  = (catalog.artifactRegistry ?: [:]) as Map
+                                String regProject = cfg.registryProjectId ?: (regCfg.gcpProjectId ?: 'project-d7b18774-cce1-4b87-a4a')
+                                String regRegion  = cfg.registryRegion    ?: (regCfg.gcpRegion    ?: 'us-central1')
+                                String gitShort   = env.GIT_COMMIT ? env.GIT_COMMIT.take(7) : (isUnix()
+                                        ? sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD 2>/dev/null || echo latest').trim()
+                                        : 'latest')
+                                env.IMAGE_TAG           = "${env.BUILD_NUMBER}-${gitShort ?: 'latest'}"
+                                env.REGISTRY_PROJECT_ID = regProject
+                                env.REGISTRY_REGION     = regRegion
+                                env.IMAGE_URI           = "${regRegion}-docker.pkg.dev/${regProject}/${params.AR_REPO}/${params.IMAGE_NAME}:${env.IMAGE_TAG}"
+                                env.IS_UNIX_AGENT       = isUnix().toString()
+                                echo "App: ${env.APP_NAME} | QG: ${env.ENABLED_QG} | Promotion Chain: ${env.PROMOTE_CHAIN}"
+                                echo "Single immutable image for all environments: ${env.IMAGE_URI}"
+                            }
                         }
                     }
-                }
-                post {
-                    always {
-                        junit allowEmptyResults: true, testResults: 'build/test-results/test/*.xml'
-                    }
-                }
-            }
 
-            stage('QG2 - Integration Tests') {
-                when { expression { return isGateEnabled('QG2') } }
-                steps {
-                    script {
-                        if (isUnix()) {
-                            sh 'chmod +x gradlew && ./gradlew integrationTest --no-daemon'
-                        } else {
-                            bat 'gradlew.bat integrationTest --no-daemon'
+                    stage('QG1 - Unit Tests') {
+                        when { expression { return isGateEnabled('QG1') } }
+                        steps {
+                            script {
+                                if (isUnix()) {
+                                    sh 'chmod +x gradlew && ./gradlew clean test --no-daemon'
+                                } else {
+                                    bat 'gradlew.bat clean test --no-daemon'
+                                }
+                            }
+                        }
+                        post {
+                            always {
+                                junit allowEmptyResults: true, testResults: 'build/test-results/test/*.xml'
+                            }
                         }
                     }
-                }
-                post {
-                    always {
-                        junit allowEmptyResults: true, testResults: 'build/test-results/integrationTest/*.xml'
-                    }
-                }
-            }
 
-            stage('QG3 - Coverage Gate') {
-                when { expression { return isGateEnabled('QG3') } }
-                steps {
-                    script {
-                        if (isUnix()) {
-                            sh 'chmod +x gradlew && ./gradlew jacocoTestReport jacocoTestCoverageVerification --no-daemon'
-                        } else {
-                            bat 'gradlew.bat jacocoTestReport jacocoTestCoverageVerification --no-daemon'
+                    stage('QG2 - Integration Tests') {
+                        when { expression { return isGateEnabled('QG2') } }
+                        steps {
+                            script {
+                                if (isUnix()) {
+                                    sh 'chmod +x gradlew && ./gradlew integrationTest --no-daemon'
+                                } else {
+                                    bat 'gradlew.bat integrationTest --no-daemon'
+                                }
+                            }
+                        }
+                        post {
+                            always {
+                                junit allowEmptyResults: true, testResults: 'build/test-results/integrationTest/*.xml'
+                            }
                         }
                     }
-                }
-                post {
-                    always {
-                        archiveArtifacts artifacts: 'build/reports/jacoco/test/html/**', allowEmptyArchive: true
-                    }
-                }
-            }
 
-            stage('Build & Push Image (Once)') {
-                steps {
-                    script {
-                        Map catalog = loadCatalog()
-                        Map envsMap = (catalog.environments ?: [:]) as Map
-                        if (isUnix()) {
-                            sh """
-                                gcloud config set project ${env.REGISTRY_PROJECT_ID}
-                                gcloud builds submit --tag ${env.IMAGE_URI} .
-                            """
-                        } else {
-                            Map firstEnv = resolveEnvConfig(envsMap, 'dev1', appName, cfg)
-                            powershell """
-                                \\$ErrorActionPreference = 'Stop'
-                                .\\deploy-gke.ps1 `
-                                    -ProjectId '${firstEnv.gcpProjectId}' `
-                                    -Region '${firstEnv.gcpRegion}' `
-                                    -ClusterName '${firstEnv.gkeCluster}' `
-                                    -Namespace '${firstEnv.namespace}' `
-                                    -Repository '${params.AR_REPO}' `
-                                    -ImageName '${params.IMAGE_NAME}' `
-                                    -Tag '${env.IMAGE_TAG}'
-                            """
+                    stage('QG3 - Coverage Gate') {
+                        when { expression { return isGateEnabled('QG3') } }
+                        steps {
+                            script {
+                                if (isUnix()) {
+                                    sh 'chmod +x gradlew && ./gradlew jacocoTestReport jacocoTestCoverageVerification --no-daemon'
+                                } else {
+                                    bat 'gradlew.bat jacocoTestReport jacocoTestCoverageVerification --no-daemon'
+                                }
+                            }
+                        }
+                        post {
+                            always {
+                                archiveArtifacts artifacts: 'build/reports/jacoco/test/html/**', allowEmptyArchive: true
+                            }
+                        }
+                    }
+
+                    stage('Build & Push Image (Once)') {
+                        steps {
+                            script {
+                                Map catalog = loadCatalog()
+                                Map envsMap = (catalog.environments ?: [:]) as Map
+                                if (isUnix()) {
+                                    sh """
+                                        gcloud config set project ${env.REGISTRY_PROJECT_ID}
+                                        gcloud builds submit --tag ${env.IMAGE_URI} .
+                                    """
+                                } else {
+                                    Map firstEnv = resolveEnvConfig(envsMap, 'dev1', appName, cfg)
+                                    powershell """
+                                        \\$ErrorActionPreference = 'Stop'
+                                        .\\deploy-gke.ps1 `
+                                            -ProjectId '${firstEnv.gcpProjectId}' `
+                                            -Region '${firstEnv.gcpRegion}' `
+                                            -ClusterName '${firstEnv.gkeCluster}' `
+                                            -Namespace '${firstEnv.namespace}' `
+                                            -Repository '${params.AR_REPO}' `
+                                            -ImageName '${params.IMAGE_NAME}' `
+                                            -Tag '${env.IMAGE_TAG}'
+                                    """
+                                }
+                            }
                         }
                     }
                 }
             }
 
             stage('Promote Across Environments') {
-                when { expression { return isUnix() } }
+                when { expression { return env.IS_UNIX_AGENT == 'true' } }
                 steps {
                     script {
                         Map catalog = loadCatalog()
@@ -169,36 +179,38 @@ def call(Map cfg = [:]) {
                             Map targetCfg = resolveEnvConfig(envsMap, envKey, appName, cfg)
 
                             if (idx > 0) {
+                                // Runs outside node {} -> holds 0 executors while paused waiting for approval
                                 stage("Approve Promote -> ${envKey}") {
                                     String promoteMsg = "${prevEnvInfo}. Promote immutable image ${env.IMAGE_URI} to '${envKey}' (project: ${targetCfg.gcpProjectId}, cluster: ${targetCfg.gkeCluster}, ns: ${targetCfg.namespace})? Deploys to INACTIVE slot first."
-                                    timeout(time: 15, unit: 'MINUTES') {
-                                        input message: promoteMsg, ok: "Deploy to ${envKey}"
-                                    }
+                                    awaitApproval(promoteMsg, "Deploy to ${envKey}", approvalTimeoutMinutes)
                                 }
                             }
 
-                            stage("Deploy to ${envKey}") {
-                                deployEnv(targetCfg, label)
+                            node {
+                                stage("Deploy to ${envKey}") {
+                                    deployEnv(targetCfg, label)
+                                }
+
+                                stage("Verify Liveness & Readiness - ${envKey}") {
+                                    verifySlotLivenessAndReadiness(targetCfg, label)
+                                }
                             }
 
-                            stage("Verify Liveness & Readiness - ${envKey}") {
-                                verifySlotLivenessAndReadiness(targetCfg, label)
-                            }
-
+                            // Runs outside node {} -> holds 0 executors while paused waiting for approval
                             stage("Approve Switch Live - ${envKey}") {
                                 String liveSlot   = env."${label}_LIVE_SLOT"
                                 String targetSlot = env."${label}_TARGET_SLOT"
                                 String liveImg    = env."${label}_LIVE_IMG"
                                 String lbIp       = env."${label}_LB_IP"
                                 String switchMsg  = "[${envKey} | project=${targetCfg.gcpProjectId} | ns=${targetCfg.namespace}] Liveness=UP & Readiness=UP verified on slot '${targetSlot}' (${env.IMAGE_URI}). Current live: slot '${liveSlot}' (${liveImg} @ http://${lbIp}). Approve = traffic -> '${targetSlot}', then '${liveSlot}' removed."
-                                timeout(time: 15, unit: 'MINUTES') {
-                                    input message: switchMsg, ok: "Switch Live (${envKey})"
-                                }
+                                awaitApproval(switchMsg, "Switch Live (${envKey})", approvalTimeoutMinutes)
                             }
 
-                            stage("Switch Live - ${envKey}") {
-                                switchLiveAndSmoke(targetCfg, label)
-                                prevEnvInfo = "${envKey} is live on slot '${env."${label}_TARGET_SLOT"}' @ http://${env."${label}_LB_IP"}"
+                            node {
+                                stage("Switch Live - ${envKey}") {
+                                    switchLiveAndSmoke(targetCfg, label)
+                                    prevEnvInfo = "${envKey} is live on slot '${env."${label}_TARGET_SLOT"}' @ http://${env."${label}_LB_IP"}"
+                                }
                             }
 
                             if (idx == 0 && isGateEnabled('QG4')) {
@@ -227,17 +239,29 @@ def call(Map cfg = [:]) {
 
         post {
             always {
-                script {
-                    if (isUnix()) {
-                        sh '''
-                            ps -eo pid,ppid,etimes,comm \
-                              | awk '$2 == 1 && $3 > 1800 && ($4 == "sh" || $4 == "bash") { print $1 }' \
-                              | xargs -r kill -9 2>/dev/null || true
-                        '''
+                node {
+                    script {
+                        if (isUnix()) {
+                            sh '''
+                                ps -eo pid,ppid,etimes,comm \
+                                  | awk '$2 == 1 && $3 > 1800 && ($4 == "sh" || $4 == "bash") { print $1 }' \
+                                  | xargs -r kill -9 2>/dev/null || true
+                            '''
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+def awaitApproval(String msg, String okLabel, int timeoutMinutes = 0) {
+    if (timeoutMinutes > 0) {
+        timeout(time: timeoutMinutes, unit: 'MINUTES') {
+            input message: msg, ok: okLabel
+        }
+    } else {
+        input message: msg, ok: okLabel
     }
 }
 

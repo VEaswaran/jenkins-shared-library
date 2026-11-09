@@ -3,7 +3,7 @@
 Reusable Jenkins Global Shared Library for Spring Boot + Gradle microservices deploying to GKE with Blue/Green slots, staged approvals, and Snyk security scanning.
 
 ## Structure
-- `vars/springGkePipeline.groovy` — Build-Once, Promote-Many CI/CD pipeline (QG1-QG4 quality gates, single Artifact Registry build, sequential promotion across environments with Blue/Green deploy, manual approvals, traffic switch, smoke check, and old-slot deletion)
+- `vars/springGkePipeline.groovy` — Build-Once, Promote-Many CI/CD pipeline (QG1-QG4 quality gates, single Artifact Registry build, sequential promotion across environments with Blue/Green deploy, executor-free manual approval gates that pause indefinitely until approved, traffic switch, smoke check, and old-slot deletion)
 - `vars/snykScanPipeline.groovy` — Independent Snyk CLI vulnerability scan pipeline
 - `resources/environments.json` — Central enterprise environment catalog mapping `artifactRegistry` and each environment (`dev1`, `dev2`, `test`, `perf`, `stage`, `prod`) to its own `gcpProjectId`, `gcpRegion`, `gkeCluster`, and namespace suffix
 - `resources/k8s/deployment.yaml` & `resources/k8s/service.yaml` — Default parameterized Kubernetes manifests used automatically if a project repo does not provide its own `k8s/` folder
